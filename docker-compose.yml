@@ -1,0 +1,12 @@
+services:
+  mariadb-monitor:
+    build: .
+    container_name: mariadb-monitor
+    restart: unless-stopped
+    network_mode: host          # reaches 127.0.0.1:3306 directly
+    env_file: .env
+    volumes:
+      - state:/var/lib/mariadb-monitor
+
+volumes:
+  state:
