@@ -144,9 +144,10 @@ def should_alert(state, key, ttl_sec):
 # ─── Slack ─────────────────────────────────────────────────────────────────────
 
 def post_slack(webhook, blocks):
+    log.info("Sending Slack alert (%d blocks)", len(blocks))
+    log.info(json.dumps(blocks, indent=2))
     if not webhook:
-        log.warning("SLACK_WEBHOOK not set — printing to stdout instead")
-        log.info(json.dumps(blocks, indent=2))
+        log.warning("SLACK_WEBHOOK not set — alert not sent to Slack")
         return
     payload = json.dumps({"blocks": blocks}).encode()
     req = urllib.request.Request(
@@ -159,8 +160,41 @@ def post_slack(webhook, blocks):
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status != 200:
                 log.error("Slack returned %s", resp.status)
+            else:
+                log.info("Slack alert sent successfully")
     except urllib.error.URLError as e:
         log.error("Slack POST failed: %s", e)
+
+
+def build_startup_test_blocks(cfg):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "MariaDB Monitor Started — " + cfg["db_host"]},
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "This is a startup test alert."},
+        },
+        {
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": (
+                    f"Poll every {cfg['poll_interval_sec']}s | "
+                    f"Slow ≥{cfg['slow_threshold_sec']}s | "
+                    f"Long-running ≥{cfg['long_running_sec']}s | "
+                    f"Min exec count {cfg['min_exec_count']} | {now}"
+                ),
+            }],
+        },
+    ]
+
+
+def send_startup_test_alert(cfg):
+    log.info("Sending startup test alert")
+    post_slack(cfg["slack_webhook"], build_startup_test_blocks(cfg))
 
 
 def build_slow_digest_blocks(rows, threshold_sec, host):
@@ -293,6 +327,8 @@ def main():
         "state_file":       args.state_file,
         "state_ttl_sec":    args.state_ttl_sec,
     }
+
+    send_startup_test_alert(cfg)
 
     if args.once:
         run_once(cfg)

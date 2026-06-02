@@ -51,9 +51,13 @@ chmod 600 .env
 | `STATE_TTL_SEC`      | `3600`                                | Re-alert after this many seconds          |
 | `STATE_FILE`         | `/var/lib/mariadb-monitor/state.json` | Dedup state path                          |
 
-If `SLACK_WEBHOOK` is unset, alerts are printed to stdout as JSON (useful for testing).
+If `SLACK_WEBHOOK` is unset, alerts are logged to stdout but not sent to Slack (useful for testing).
 
 CLI flags override env vars. Run `python3 mariadb_monitor.py --help` for the full list.
+
+## Startup
+
+On every launch (including `--once`/cron runs), the monitor sends a **startup test alert** to Slack (when `SLACK_WEBHOOK` is set) and logs the full alert payload to stdout. Use this to confirm webhook connectivity after deploy or container restart.
 
 ## Run with Docker (recommended)
 
