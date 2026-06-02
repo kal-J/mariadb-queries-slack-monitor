@@ -1,0 +1,1 @@
+# mariadb-queries-slack-monitor
