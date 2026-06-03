@@ -4,12 +4,16 @@ Polls MariaDB `performance_schema` for slow queries and `information_schema.proc
 
 ## What it monitors
 
-| Alert type               | Source                                                   | Default threshold                       |
-| ------------------------ | -------------------------------------------------------- | --------------------------------------- |
-| **Slow query digests**   | `performance_schema.events_statements_summary_by_digest` | Avg execution time ≥ 2s, ≥ 5 executions |
-| **Long-running queries** | `information_schema.processlist`                         | Currently running ≥ 30s                 |
+| Alert type               | Source                                                   | Default threshold                                      |
+| ------------------------ | -------------------------------------------------------- | ------------------------------------------------------ |
+| **Slow query digests**   | `performance_schema.events_statements_summary_by_digest` | Lifetime avg execution time ≥ 2s, ≥ 5 total executions |
+| **Long-running queries** | `information_schema.processlist`                         | Currently running ≥ 30s                                |
 
-Duplicate alerts are suppressed using a state file. The same digest or process is not re-alerted until the TTL expires (default: 1 hour).
+**Slow digest stats are lifetime cumulative** (since MariaDB server start or last `performance_schema` reset), not per poll interval. Execution counts and avg/max/min only change when the query runs again on the server.
+
+**Slow digest deduplication** alerts only when stats change: new executions, a higher max time, or a meaningful shift in lifetime avg. Unchanged digests are not re-sent on a timer. **Long-running** alerts still use a TTL (default 1 hour) per process key so repeated notifications for the same long job are limited.
+
+`Avg rows examined: 0` on `CALL` / stored procedures is common at the outer statement level in `performance_schema`.
 
 ## Prerequisites
 
@@ -37,19 +41,19 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-| Variable             | Default                               | Description                               |
-| -------------------- | ------------------------------------- | ----------------------------------------- |
-| `DB_HOST`            | `127.0.0.1`                           | MariaDB host                              |
-| `DB_PORT`            | `3306`                                | MariaDB port                              |
-| `DB_USER`            | `monitor`                             | Database user                             |
-| `DB_PASSWORD`        | —                                     | Database password                         |
-| `SLACK_WEBHOOK`      | —                                     | Slack incoming webhook URL                |
-| `SLOW_THRESHOLD_SEC` | `2.0`                                 | Min avg execution time to alert (seconds) |
-| `LONG_RUNNING_SEC`   | `30.0`                                | Min current runtime to alert (seconds)    |
-| `MIN_EXEC_COUNT`     | `5`                                   | Ignore rarely-run query digests           |
-| `POLL_INTERVAL_SEC`  | `300`                                 | Poll interval in loop mode (seconds)      |
-| `STATE_TTL_SEC`      | `3600`                                | Re-alert after this many seconds          |
-| `STATE_FILE`         | `/var/lib/mariadb-monitor/state.json` | Dedup state path                          |
+| Variable             | Default                               | Description                                                                               |
+| -------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `DB_HOST`            | `127.0.0.1`                           | MariaDB host                                                                              |
+| `DB_PORT`            | `3306`                                | MariaDB port                                                                              |
+| `DB_USER`            | `monitor`                             | Database user                                                                             |
+| `DB_PASSWORD`        | —                                     | Database password                                                                         |
+| `SLACK_WEBHOOK`      | —                                     | Slack incoming webhook URL                                                                |
+| `SLOW_THRESHOLD_SEC` | `2.0`                                 | Min avg execution time to alert (seconds)                                                 |
+| `LONG_RUNNING_SEC`   | `30.0`                                | Min current runtime to alert (seconds)                                                    |
+| `MIN_EXEC_COUNT`     | `5`                                   | Ignore rarely-run query digests                                                           |
+| `POLL_INTERVAL_SEC`  | `300`                                 | Poll interval in loop mode (seconds)                                                      |
+| `STATE_TTL_SEC`      | `3600`                                | Long-running dedup: re-alert after this many seconds (slow digests use change-only dedup) |
+| `STATE_FILE`         | `/var/lib/mariadb-monitor/state.json` | Dedup state path (stores per-digest snapshots for slow alerts)                            |
 
 If `SLACK_WEBHOOK` is unset, alerts are logged to stdout but not sent to Slack (useful for testing).
 
@@ -89,6 +93,6 @@ Example cron entry (every 5 minutes):
 
 ## Slack alert examples
 
-**Slow query digest** — includes schema, truncated query text, avg/max time, execution count, rows examined, and a no-index warning when applicable.
+**Slow query digest** — lifetime min/avg/max, total execution count, delta since last alert (when applicable), last seen time, avg rows examined, and a no-index warning when applicable.
 
 **Long-running query** — includes PID, user, host, database, runtime, and truncated query text.

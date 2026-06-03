@@ -48,6 +48,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("mariadb-monitor")
 
+AVG_EPSILON = 0.001
+
 
 # ─── Database ──────────────────────────────────────────────────────────────────
 
@@ -72,7 +74,11 @@ def fetch_slow_digests(conn, threshold_sec, min_count):
             schema_name,
             count_star                       AS exec_count,
             ROUND(avg_timer_wait / 1e12, 3)  AS avg_sec,
+            ROUND(min_timer_wait / 1e12, 3)  AS min_sec,
             ROUND(max_timer_wait / 1e12, 3)  AS max_sec,
+            ROUND(sum_timer_wait / 1e12, 3)  AS total_sec,
+            first_seen,
+            last_seen,
             ROUND(sum_rows_examined / count_star) AS avg_rows_examined,
             ROUND(sum_rows_sent / count_star)     AS avg_rows_sent,
             sum_no_good_index_used + sum_no_index_used AS no_index_count
@@ -132,13 +138,79 @@ def save_state(path, state):
 
 
 def should_alert(state, key, ttl_sec):
-    """Return True if we haven't alerted for this key recently."""
+    """Return True if we haven't alerted for this key recently (long-running queries)."""
     now = time.time()
     last = state.get(key, 0)
+    if isinstance(last, dict):
+        last = last.get("alerted_at", 0)
     if now - last > ttl_sec:
         state[key] = now
         return True
     return False
+
+
+def _digest_snapshot(prev):
+    """Return previous snapshot dict, or None if missing / legacy timestamp-only."""
+    if prev is None:
+        return None
+    if isinstance(prev, (int, float)):
+        return None
+    if isinstance(prev, dict) and "exec_count" in prev:
+        return prev
+    return None
+
+
+def should_alert_slow_digest(state, row):
+    """
+    Alert only when digest stats change (new executions, higher max, or avg shift).
+    Returns (should_alert, delta_info).
+    """
+    key = f"digest:{row['digest']}"
+    prev = _digest_snapshot(state.get(key))
+    now = time.time()
+
+    if prev is None:
+        state[key] = {
+            "alerted_at": now,
+            "exec_count": row["exec_count"],
+            "avg_sec": float(row["avg_sec"]),
+            "max_sec": float(row["max_sec"]),
+        }
+        return True, {"first_alert": True}
+
+    exec_delta = row["exec_count"] - prev["exec_count"]
+    max_increased = float(row["max_sec"]) > float(prev["max_sec"])
+    avg_changed = abs(float(row["avg_sec"]) - float(prev["avg_sec"])) > AVG_EPSILON
+
+    if exec_delta == 0 and not max_increased and not avg_changed:
+        return False, None
+
+    delta = {
+        "first_alert": False,
+        "exec_delta": exec_delta,
+        "prev_max_sec": prev["max_sec"],
+        "prev_avg_sec": prev["avg_sec"],
+    }
+    state[key] = {
+        "alerted_at": now,
+        "exec_count": row["exec_count"],
+        "avg_sec": float(row["avg_sec"]),
+        "max_sec": float(row["max_sec"]),
+    }
+    return True, delta
+
+
+def format_ps_timestamp(ts):
+    """Format performance_schema first_seen / last_seen for Slack."""
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = ts.astimezone(timezone.utc)
+        return ts.strftime("%Y-%m-%d %H:%M UTC")
+    return str(ts)
 
 
 # ─── Slack ─────────────────────────────────────────────────────────────────────
@@ -197,6 +269,22 @@ def send_startup_test_alert(cfg):
     post_slack(cfg["slack_webhook"], build_startup_test_blocks(cfg))
 
 
+def _format_slow_digest_delta(delta):
+    if not delta or delta.get("first_alert"):
+        return None
+    parts = []
+    exec_delta = delta.get("exec_delta", 0)
+    if exec_delta > 0:
+        parts.append(f"+{exec_delta} execution{'s' if exec_delta != 1 else ''}")
+    prev_max = delta.get("prev_max_sec")
+    if prev_max is not None and delta.get("max_increased"):
+        parts.append(f"max was {prev_max}s")
+    prev_avg = delta.get("prev_avg_sec")
+    if prev_avg is not None and delta.get("avg_changed"):
+        parts.append(f"avg was {prev_avg}s")
+    return ", ".join(parts) if parts else None
+
+
 def build_slow_digest_blocks(rows, threshold_sec, host):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     blocks = [
@@ -206,18 +294,43 @@ def build_slow_digest_blocks(rows, threshold_sec, host):
         },
         {
             "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"Queries averaging >{threshold_sec}s | {now}"}],
+            "elements": [{
+                "type": "mrkdwn",
+                "text": (
+                    f"Slow digests (lifetime avg ≥{threshold_sec}s, alert on new activity) | {now}"
+                ),
+            }],
         },
     ]
     for r in rows:
         no_index = " ⚠️ *no index*" if r["no_index_count"] > 0 else ""
-        text = (
-            f"*Schema:* `{r['schema_name'] or 'n/a'}`{no_index}\n"
-            f"*Query:* `{r['digest_text']}`\n"
-            f"*Avg:* {r['avg_sec']}s  *Max:* {r['max_sec']}s  "
-            f"*Executions:* {r['exec_count']}  "
-            f"*Avg rows examined:* {r['avg_rows_examined']}"
-        )
+        delta = r.get("_delta") or {}
+        if not delta.get("first_alert"):
+            delta = dict(delta)
+            delta["max_increased"] = (
+                delta.get("prev_max_sec") is not None
+                and float(r["max_sec"]) > float(delta["prev_max_sec"])
+            )
+            delta["avg_changed"] = (
+                delta.get("prev_avg_sec") is not None
+                and abs(float(r["avg_sec"]) - float(delta["prev_avg_sec"])) > AVG_EPSILON
+            )
+        delta_line = _format_slow_digest_delta(delta)
+        last_seen = format_ps_timestamp(r.get("last_seen"))
+        lines = [
+            f"*Schema:* `{r['schema_name'] or 'n/a'}`{no_index}",
+            f"*Query:* `{r['digest_text']}`",
+            (
+                f"*Lifetime avg:* {r['avg_sec']}s  *min:* {r['min_sec']}s  "
+                f"*max:* {r['max_sec']}s  *total executions:* {r['exec_count']}"
+            ),
+        ]
+        if delta_line:
+            lines.append(f"*New since last alert:* {delta_line}")
+        if last_seen:
+            lines.append(f"*Last seen:* {last_seen}")
+        lines.append(f"*Avg rows examined:* {r['avg_rows_examined']}")
+        text = "\n".join(lines)
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
         blocks.append({"type": "divider"})
     return blocks
@@ -266,10 +379,13 @@ def run_once(cfg):
                 cfg["slow_threshold_sec"],
                 cfg["min_exec_count"],
             )
-            new_slow = [
-                r for r in slow_rows
-                if should_alert(state, f"digest:{r['digest']}", cfg["state_ttl_sec"])
-            ]
+            new_slow = []
+            for r in slow_rows:
+                alert, delta = should_alert_slow_digest(state, r)
+                if alert:
+                    row = dict(r)
+                    row["_delta"] = delta
+                    new_slow.append(row)
             if new_slow:
                 log.info("Alerting on %d slow digest(s)", len(new_slow))
                 blocks = build_slow_digest_blocks(new_slow, cfg["slow_threshold_sec"], cfg["db_host"])
